@@ -15,7 +15,7 @@ pub enum Job {
 pub enum Msg {
     Main {
         generation: u64,
-        result: Result<(egui::ColorImage, Meta), String>,
+        result: Result<(egui::ColorImage, egui::ColorImage, Meta), String>,
     },
     Thumb {
         path: PathBuf,
@@ -91,17 +91,37 @@ fn do_thumb(mtx: &Sender<Msg>, ctx: &egui::Context, path: &Path) {
     ctx.request_repaint();
 }
 
-fn load_main(path: &Path) -> Result<(egui::ColorImage, Meta), String> {
+fn load_main(path: &Path) -> Result<(egui::ColorImage, egui::ColorImage, Meta), String> {
     let reader = image::ImageReader::open(path).map_err(|e| format!("Cannot open: {e}"))?;
     let img = reader.decode().map_err(|e| format!("Cannot decode: {e}"))?;
     let (w, h) = (img.width(), img.height());
+
+    // Small, pre-blurred copy used as the tinted window background.
+    let long = w.max(h);
+    let target = (long / 8).clamp(128, 320);
+    let bg_dyn = if long > target {
+        let s = target as f32 / long as f32;
+        img.resize(
+            (w as f32 * s).max(1.0) as u32,
+            (h as f32 * s).max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img.clone()
+    };
+    let bg_rgba = bg_dyn.to_rgba8();
+    let bg = egui::ColorImage::from_rgba_unmultiplied(
+        [bg_rgba.width() as usize, bg_rgba.height() as usize],
+        bg_rgba.as_raw(),
+    );
+
     let rgba = img.to_rgba8();
     let color = egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
     );
     let meta = meta::read(path, w, h);
-    Ok((color, meta))
+    Ok((color, bg, meta))
 }
 
 fn load_thumb(path: &Path) -> Result<egui::ColorImage, String> {

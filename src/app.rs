@@ -12,6 +12,7 @@ const EXTENSIONS: &[&str] = &[
 ];
 
 const PANEL_W: f32 = 276.0;
+const PANEL_FADE: f32 = 44.0;
 const ITEM_W: f32 = 120.0;
 const ITEM_H: f32 = 96.0;
 const THUMB_H: f32 = 62.0;
@@ -27,6 +28,7 @@ pub struct Viewer {
     generation: u64,
     loading: bool,
     image: Option<(TextureHandle, Meta)>,
+    bg: Option<TextureHandle>,
     error: Option<String>,
     loader: Loader,
     thumbs: HashMap<PathBuf, TextureHandle>,
@@ -39,13 +41,6 @@ pub struct Viewer {
     last_move: f64,
     last_pos: Option<Pos2>,
     scroll_to: bool,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    started: std::time::Instant,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    fired: Vec<bool>,
-    central_rect: Rect,
-    arrow_rects: Option<(Rect, Rect)>,
-    item_rects: Vec<Rect>,
 }
 
 impl Viewer {
@@ -57,6 +52,7 @@ impl Viewer {
             generation: 0,
             loading: false,
             image: None,
+            bg: None,
             error: None,
             loader: Loader::new(_cc.egui_ctx.clone()),
             thumbs: HashMap::new(),
@@ -69,11 +65,6 @@ impl Viewer {
             last_move: -1e9,
             last_pos: None,
             scroll_to: false,
-            started: std::time::Instant::now(),
-            fired: Vec::new(),
-            central_rect: Rect::NOTHING,
-            arrow_rects: None,
-            item_rects: Vec::new(),
         };
         if let Some(p) = path {
             v.open_path(&p);
@@ -148,12 +139,17 @@ impl Viewer {
                 Msg::Main { generation, result } if generation == self.generation => {
                     self.loading = false;
                     match result {
-                        Ok((img, meta)) => {
+                        Ok((img, bg_img, meta)) => {
                             let tex = ctx.load_texture(
                                 format!("main-{generation}"),
                                 img,
                                 TextureOptions::LINEAR,
                             );
+                            self.bg = Some(ctx.load_texture(
+                                format!("bg-{generation}"),
+                                bg_img,
+                                TextureOptions::LINEAR,
+                            ));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                                 "{} — Image Viewer",
                                 meta.name
@@ -163,6 +159,7 @@ impl Viewer {
                         }
                         Err(e) => {
                             self.image = None;
+                            self.bg = None;
                             self.error = Some(e);
                         }
                     }
@@ -218,23 +215,65 @@ impl Viewer {
         }
     }
 
+    /// Blurred, darkened copy of the current image covering the whole window.
+    fn paint_background(&self, ui: &mut egui::Ui) {
+        let full = ui.max_rect();
+        let painter = ui.painter().with_clip_rect(full);
+        painter.rect_filled(full, 0.0, Color32::from_rgb(22, 22, 26));
+        if let Some(bg) = &self.bg {
+            let (w, h) = {
+                let s = bg.size();
+                (s[0] as f32, s[1] as f32)
+            };
+            let scale = (full.width() / w).max(full.height() / h);
+            let size = egui::vec2(w * scale, h * scale);
+            let rect = Rect::from_center_size(full.center(), size);
+            painter.image(
+                bg.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::from_rgb(94, 94, 98), // darkening tint
+            );
+            painter.rect_filled(full, 0.0, Color32::from_black_alpha(48));
+        }
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let full = ui.max_rect();
-        self.central_rect = full;
         let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.stable_dt) as f64;
-        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut pointer = ctx.input(|i| i.pointer.latest_pos());
+        // Info panel trigger: rightmost 1/8th of the window.
+        let zone_x = full.right() - full.width() / 8.0;
+        #[cfg(debug_assertions)]
+        if let Ok(force) = std::env::var("IV_FORCE") {
+            // Debug-only pointer simulation for automated screenshot tests.
+            ctx.request_repaint(); // keep frames coming; egui would otherwise idle
+            let jitter = ((now * 6.0).sin() * 6.0) as f32;
+            let zone_c = zone_x + full.width() / 16.0;
+            pointer = match force.as_str() {
+                "zone" => Some(Pos2::new(zone_c + jitter, full.center().y)),
+                "zone_once" => {
+                    let j = if now < 1.0 { jitter } else { 0.0 };
+                    Some(Pos2::new(zone_c + j, full.center().y))
+                }
+                "center" => Some(Pos2::new(full.center().x + jitter, full.center().y)),
+                _ => pointer,
+            };
+        }
         let inside = pointer.is_some_and(|p| full.contains(p));
+        let in_zone = pointer.is_some_and(|p| p.x >= zone_x && full.contains(p));
         if let (Some(p), Some(lp)) = (pointer, self.last_pos) {
-            if p != lp && inside {
+            if p != lp && in_zone {
                 self.last_move = now;
             }
         }
         self.last_pos = pointer;
 
         let k = (1.0 - (-dt * 10.0).exp()) as f32;
-        let panel_t = if inside && now - self.last_move < PANEL_IDLE_SECS {
+        let panel_t = if in_zone && now - self.last_move < PANEL_IDLE_SECS {
             1.0
         } else {
             0.0
@@ -316,21 +355,36 @@ impl Viewer {
         let rect = Rect::from_min_size(Pos2::new(x, full.top()), egui::vec2(PANEL_W, full.height()));
         let painter = ui.painter().with_clip_rect(full);
 
-        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, (175.0 * p) as u8));
-        painter.line_segment(
-            [Pos2::new(rect.min.x, rect.min.y), Pos2::new(rect.min.x, rect.max.y)],
-            Stroke::new(1.0, Color32::from_white_alpha((36.0 * p) as u8)),
+        let base_alpha = (175.0 * p) as u8;
+        // Solid part, then a smooth alpha ramp toward the left edge (no hard border).
+        let solid_x = rect.min.x + PANEL_FADE;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(solid_x, rect.min.y), rect.max),
+            0.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, base_alpha),
         );
+        const STRIPS: usize = 24;
+        for i in 0..STRIPS {
+            let t = (i as f32 + 0.5) / STRIPS as f32;
+            let s = t * t * (3.0 - 2.0 * t); // smoothstep
+            let sx = rect.min.x + PANEL_FADE * i as f32 / STRIPS as f32;
+            let sw = PANEL_FADE / STRIPS as f32 + 1.0;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(sx, rect.min.y), egui::vec2(sw, rect.height())),
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, (base_alpha as f32 * s) as u8),
+            );
+        }
 
-        let lx = rect.min.x + 16.0;
+        let lx = rect.min.x + PANEL_FADE + 8.0;
         let mut y = rect.min.y + 14.0;
         let gray = Color32::from_rgba_unmultiplied(165, 165, 165, a);
         let white = Color32::from_white_alpha(a);
         let dir_gray = Color32::from_rgba_unmultiplied(140, 140, 140, a);
 
-        put(&painter, lx, y, &ellipsize(&meta.name, 34), FontId::proportional(14.5), white);
+        put(&painter, lx, y, &ellipsize(&meta.name, 28), FontId::proportional(14.5), white);
         y += 22.0;
-        put(&painter, lx, y, &ellipsize(&meta.dir, 42), FontId::proportional(11.0), dir_gray);
+        put(&painter, lx, y, &ellipsize(&meta.dir, 36), FontId::proportional(11.0), dir_gray);
         y += 24.0;
 
         for (k, v) in [
@@ -351,7 +405,7 @@ impl Viewer {
             }
             y += 6.0;
             painter.line_segment(
-                [Pos2::new(lx, y), Pos2::new(lx + PANEL_W - 32.0, y)],
+                [Pos2::new(lx, y), Pos2::new(rect.max.x - 16.0, y)],
                 Stroke::new(1.0, Color32::from_white_alpha((36.0 * p) as u8)),
             );
             y += 14.0;
@@ -359,7 +413,7 @@ impl Viewer {
                 if y + 34.0 > rect.max.y {
                     return;
                 }
-                y = row(&painter, lx, y, k, &ellipsize(v, 36), gray, white);
+                y = row(&painter, lx, y, k, &ellipsize(v, 30), gray, white);
             }
         }
     }
@@ -380,7 +434,6 @@ impl Viewer {
         );
         let left = ui.interact(lr, egui::Id::unique("iv.nav_left"), Sense::click());
         let right = ui.interact(rr, egui::Id::unique("iv.nav_right"), Sense::click());
-        self.arrow_rects = Some((lr, rr));
         if left.clicked() {
             self.set_index(self.idx.wrapping_sub(1));
         }
@@ -434,7 +487,6 @@ impl Viewer {
     }
 
     fn carousel(&mut self, ui: &mut egui::Ui) {
-        self.item_rects.clear();
         let n = self.files.len();
         egui::ScrollArea::horizontal()
             .id_salt("carousel_scroll")
@@ -453,10 +505,6 @@ impl Viewer {
     fn item(&mut self, ui: &mut egui::Ui, i: usize) {
         let path = self.files[i].clone();
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ITEM_W, ITEM_H), Sense::click());
-        if self.item_rects.len() <= i {
-            self.item_rects.resize(i + 1, Rect::NOTHING);
-        }
-        self.item_rects[i] = rect;
         if resp.clicked() {
             self.set_index(i);
         }
@@ -517,8 +565,6 @@ impl Viewer {
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        #[cfg(debug_assertions)]
-        self.automate(&ctx);
         self.tick(&ctx);
         self.keys(&ctx);
 
@@ -529,83 +575,18 @@ impl eframe::App for Viewer {
             break;
         }
 
+        self.paint_background(ui);
+
         if self.carousel {
-            egui::Panel::bottom("carousel").show(ui, |ui| self.carousel(ui));
+            egui::Panel::bottom("carousel")
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.carousel(ui));
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.central(ui));
+        egui::CentralPanel::no_frame().show(ui, |ui| self.central(ui));
     }
 }
 
-#[cfg(debug_assertions)]
-impl Viewer {
-    /// Debug-only input scripting for automated screenshot tests.
-    /// Compiled out of release builds entirely.
-    #[cfg(debug_assertions)]
-    fn automate(&mut self, ctx: &egui::Context) {
-        enum Act {
-            Move(Pos2),
-            Press(Pos2),
-            Release(Pos2),
-            Key(egui::Key),
-        }
-        let Ok(script) = std::env::var("IV_TEST") else {
-            return;
-        };
-        let c = self.central_rect.center();
-        let arrow_c = self.arrow_rects.map(|(_, r)| r.center()).unwrap_or(c);
-        let item_c = self.item_rects.get(1).map(|r| r.center()).unwrap_or(c);
-        let acts: Vec<(f64, Act)> = match script.as_str() {
-            // Keep moving the pointer so the metadata panel stays open for the shot.
-            "panel" => (0..12).map(|i| (0.8 + 0.4 * i as f64, Act::Move(c))).collect(),
-            "autohide" => vec![(0.8, Act::Move(c))],
-            "toggle" => vec![(0.8, Act::Move(c)), (1.6, Act::Key(egui::Key::C))],
-            "arrowkey" => vec![(1.0, Act::Key(egui::Key::ArrowRight))],
-            "arrow" => vec![
-                (0.9, Act::Move(arrow_c)),
-                (1.5, Act::Press(arrow_c)),
-                (1.65, Act::Release(arrow_c)),
-            ],
-            "thumb" => vec![
-                (1.0, Act::Move(item_c)),
-                (1.6, Act::Press(item_c)),
-                (1.75, Act::Release(item_c)),
-            ],
-            _ => vec![],
-        };
-        let t = self.started.elapsed().as_secs_f64();
-        if self.fired.len() < acts.len() {
-            self.fired.resize(acts.len(), false);
-        }
-        for (i, (at, act)) in acts.iter().enumerate() {
-            if t >= *at && !self.fired[i] {
-                self.fired[i] = true;
-                ctx.input_mut(|inp| match act {
-                    Act::Move(p) => inp.events.push(egui::Event::PointerMoved(*p)),
-                    Act::Press(p) => inp.events.push(egui::Event::PointerButton {
-                        pos: *p,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    }),
-                    Act::Release(p) => inp.events.push(egui::Event::PointerButton {
-                        pos: *p,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }),
-                    Act::Key(k) => inp.events.push(egui::Event::Key {
-                        key: *k,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }),
-                });
-            }
-        }
-    }
-}
 
 fn fit_rect(w: u32, h: u32, avail: Rect) -> Rect {
     let (w, h) = (w.max(1) as f32, h.max(1) as f32);

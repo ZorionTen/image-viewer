@@ -9,13 +9,17 @@ A fast, minimal, bezel-less image viewer written in Rust (egui/efui-free, built 
 
 - **Full-bleed main view** — the opened image, letterboxed, no borders or toolbars.
   Only normal OS window decorations.
+- **Ambient background** — the current image also covers the entire window behind
+  everything else, blurred and darkened with a black tint.
 - **Hover navigation arrows** — previous/next chevrons fade in only while the pointer
   is over the main view.
-- **Metadata side panel** — move the mouse inside the view and a translucent black
-  panel slides in from the right over the image, showing file name, location, format,
-  dimensions, file size, last-modified time and selected EXIF fields (camera, lens,
-  focal length, aperture, exposure, ISO, date taken, artist, software). It
-  automatically hides after ~2 seconds of idling, or when the pointer leaves the view.
+- **Metadata side panel** — move the mouse into the rightmost 1/8th of the window and
+  a translucent black panel slides in from the right over the image, its left edge
+  softly faded into the picture (no hard border). It shows file name, location,
+  format, dimensions, file size, last-modified time and selected EXIF fields (camera,
+  lens, focal length, aperture, exposure, ISO, date taken, artist, software). It
+  automatically hides after ~2 seconds of idling, or when the pointer leaves that
+  zone.
 - **Bottom carousel** — every other image in the same folder, with file names. Click a
   thumbnail (or use the arrow keys) to switch images; the selection is highlighted and
   the carousel scrolls to keep it in view. The carousel reserves its own layout space —
