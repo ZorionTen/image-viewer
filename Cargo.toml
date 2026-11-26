@@ -1,0 +1,15 @@
+[package]
+name = "image-viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp", "tiff", "ico", "pnm"] }
+kamadak-exif = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
