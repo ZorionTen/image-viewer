@@ -55,6 +55,9 @@ pub struct Viewer {
     arrow: f32,
     panel: f32,
     zoom: f32,
+    /// Pan offset of the zoomed image from the centered position. Axes that
+    /// fit the view are kept centered (their component is zeroed).
+    pan: egui::Vec2,
     scroll_to: bool,
     /// Rect the main image was drawn at last frame (drives the glow).
     view_rect: Option<Rect>,
@@ -82,6 +85,7 @@ impl Viewer {
             arrow: 0.0,
             panel: 0.0,
             zoom: 1.0,
+            pan: egui::Vec2::ZERO,
             scroll_to: false,
             view_rect: None,
             bg: None,
@@ -151,6 +155,7 @@ impl Viewer {
         self.loading = true;
         self.error = None;
         self.zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
         self.scroll_to = true;
         let path = self.files[self.idx].clone();
         let _ = self.loader.tx.send(Job::Main { generation: self.generation, path });
@@ -318,15 +323,36 @@ impl Viewer {
         let inside = pointer.is_some_and(|p| full.contains(p));
         let in_zone = pointer.is_some_and(|p| p.x >= zone_x && full.contains(p));
 
-        // Ctrl + scroll zooms the main image (1/8x .. 8x).
+        // Ctrl + scroll zooms toward the pointer (1/8x .. 8x). The pan offset
+        // is adjusted so the image point under the cursor stays put — only at
+        // the scroll instant, never continuously (the image does not follow
+        // the mouse afterwards).
         let scroll = ctx.input(|i| i.smooth_scroll_delta);
         if scroll.y != 0.0 && ctx.input(|i| i.modifiers.ctrl || i.modifiers.command) {
-            self.zoom = (self.zoom * (scroll.y * 0.002).exp()).clamp(ZOOM_MIN, ZOOM_MAX);
+            if let Some((_, meta)) = self.image.as_ref() {
+                let avail = full.shrink(18.0);
+                let z0 = self.zoom;
+                let z1 = (z0 * (scroll.y * 0.002).exp()).clamp(ZOOM_MIN, ZOOM_MAX);
+                if let Some(p) = pointer.filter(|p| avail.contains(*p)) {
+                    let c = fit_rect(meta.w, meta.h, avail).center();
+                    let q = (p - c - self.pan) / z0; // image point under the cursor
+                    self.pan = p - c - q * z1;
+                }
+                self.zoom = z1;
+            }
         }
         #[cfg(debug_assertions)]
         if let Ok(z) = std::env::var("IV_ZOOM") {
             if let Ok(z) = z.parse::<f32>() {
                 self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX); // fixed zoom for screenshots
+            }
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(p) = std::env::var("IV_PAN") {
+            if let Some((x, y)) = p.split_once(',') {
+                if let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
+                    self.pan = egui::Vec2::new(x, y); // forced pan for screenshots
+                }
             }
         }
 
@@ -343,7 +369,14 @@ impl Viewer {
 
         let image = self.image.take();
         if let Some((tex, meta)) = &image {
-            let rect = zoomed_fit_rect(meta.w, meta.h, self.zoom, full.shrink(18.0), pointer);
+            let avail = full.shrink(18.0);
+            // Click-drag pans the zoomed image. Arrows, the zoom pill and the
+            // toggle are interacted AFTER this surface, so they win hit-testing.
+            let drag = ui.interact(avail, egui::Id::unique("iv.main"), Sense::click_and_drag());
+            if drag.dragged() {
+                self.pan += ctx.input(|i| i.pointer.delta());
+            }
+            let rect = self.image_rect(meta.w, meta.h, avail);
             self.view_rect = Some(rect);
             ui.painter().image(
                 tex.id(),
@@ -351,6 +384,11 @@ impl Viewer {
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 Color32::WHITE,
             );
+            if drag.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if self.zoom != 1.0 && pointer.is_some_and(|p| rect.contains(p)) {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
             self.paint_zoom(ui, full);
             self.paint_meta(ui, full, meta);
             if self.loading {
@@ -517,7 +555,46 @@ impl Viewer {
         }
     }
 
+    /// Main-image rect for the current zoom/pan: the fit rect scaled about its
+    /// center, translated by `pan`, then per-axis pin/center clamps. Pan
+    /// components on auto-centered (fit) axes are zeroed, and clamp results are
+    /// written back, so `self.pan` always equals the true visual offset — a
+    /// stale offset can never resurface when zoom or size changes.
+    fn image_rect(&mut self, w: u32, h: u32, avail: Rect) -> Rect {
+        let fit = fit_rect(w, h, avail);
+        if (self.zoom - 1.0).abs() < 1e-4 {
+            self.pan = egui::Vec2::ZERO;
+            return fit;
+        }
+        let size = fit.size() * self.zoom;
+        let c = fit.center() + self.pan;
+        let cx = if size.x >= avail.width() {
+            let cx = c.x.clamp(
+                avail.right() - size.x * 0.5,
+                avail.left() + size.x * 0.5,
+            );
+            self.pan.x = cx - fit.center().x;
+            cx
+        } else {
+            self.pan.x = 0.0;
+            avail.center().x
+        };
+        let cy = if size.y >= avail.height() {
+            let cy = c.y.clamp(
+                avail.bottom() - size.y * 0.5,
+                avail.top() + size.y * 0.5,
+            );
+            self.pan.y = cy - fit.center().y;
+            cy
+        } else {
+            self.pan.y = 0.0;
+            avail.center().y
+        };
+        Rect::from_center_size(Pos2::new(cx, cy), size)
+    }
+
     /// Zoom pill, bottom-left of the main view. Click resets to fit (100%).
+    /// When the image is panned off-center, a center button appears next to it.
     fn paint_zoom(&mut self, ui: &mut egui::Ui, full: Rect) {
         let rect = Rect::from_min_size(
             Pos2::new(full.left() + 14.0, full.bottom() - 40.0),
@@ -525,7 +602,7 @@ impl Viewer {
         );
         let resp = ui.interact(rect, egui::Id::unique("iv.zoom_label"), Sense::click());
         if resp.clicked() {
-            self.zoom = 1.0;
+            self.zoom = 1.0; // pan re-centers automatically via the fit path
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         let a = if resp.hovered() { 150.0 } else { 95.0 };
@@ -538,6 +615,36 @@ impl Viewer {
             FontId::proportional(12.5),
             Color32::from_white_alpha(235),
         );
+
+        // Center-image button: only while panned off-center (>0.5 px).
+        if self.pan.x.abs() > 0.5 || self.pan.y.abs() > 0.5 {
+            let crect = Rect::from_min_size(
+                Pos2::new(rect.max.x + 6.0, rect.min.y),
+                egui::vec2(26.0, 26.0),
+            );
+            let cresp = ui.interact(crect, egui::Id::unique("iv.center_image"), Sense::click());
+            if cresp.clicked() {
+                self.pan = egui::Vec2::ZERO;
+            }
+            let cresp = cresp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let a = if cresp.hovered() { 170.0 } else { 95.0 };
+            let painter = ui.painter();
+            painter.rect_filled(crect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, a as u8));
+            // Crosshair glyph: circle outline + 4 ticks + center dot.
+            let c = crect.center();
+            let stroke = Stroke::new(1.6, Color32::from_white_alpha(220));
+            painter.circle_stroke(c, 5.5, stroke);
+            for d in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                painter.line_segment(
+                    [
+                        c + 5.5 * egui::Vec2::new(d.0, d.1),
+                        c + 8.5 * egui::Vec2::new(d.0, d.1),
+                    ],
+                    stroke,
+                );
+            }
+            painter.circle_filled(c, 1.5, Color32::from_white_alpha(220));
+        }
     }
 
     fn paint_toggle(&mut self, ui: &mut egui::Ui, full: Rect) {
@@ -694,38 +801,6 @@ fn fit_rect(w: u32, h: u32, avail: Rect) -> Rect {
     let scale = (avail.width() / w).min(avail.height() / h);
     let size = egui::vec2(w * scale, h * scale);
     Rect::from_center_size(avail.center(), size)
-}
-
-/// The drawn main-image rect: letterboxed fit, scaled by `zoom` about the
-/// pointer (fallback: view center). Overflowing axes are pinned to the view,
-/// the others stay centered.
-fn zoomed_fit_rect(w: u32, h: u32, zoom: f32, avail: Rect, pointer: Option<Pos2>) -> Rect {
-    let fit = fit_rect(w, h, avail);
-    if (zoom - 1.0).abs() < 1e-4 {
-        return fit;
-    }
-    let anchor = pointer
-        .filter(|p| avail.contains(*p))
-        .unwrap_or(avail.center());
-    let c = anchor + (fit.center() - anchor) * zoom;
-    let size = fit.size() * zoom;
-    let cx = if size.x >= avail.width() {
-        c.x.clamp(
-            avail.right() - size.x * 0.5,
-            avail.left() + size.x * 0.5,
-        )
-    } else {
-        avail.center().x
-    };
-    let cy = if size.y >= avail.height() {
-        c.y.clamp(
-            avail.bottom() - size.y * 0.5,
-            avail.top() + size.y * 0.5,
-        )
-    } else {
-        avail.center().y
-    };
-    Rect::from_center_size(Pos2::new(cx, cy), size)
 }
 
 /// Distance from a point to a rect (0 inside).
