@@ -13,13 +13,14 @@ const EXTENSIONS: &[&str] = &[
 
 const PANEL_W: f32 = 276.0;
 const PANEL_FADE: f32 = 44.0;
+const ZOOM_MIN: f32 = 1.0 / 8.0;
+const ZOOM_MAX: f32 = 8.0;
 const ITEM_W: f32 = 120.0;
 const ITEM_H: f32 = 96.0;
 const THUMB_H: f32 = 62.0;
 
 const ARROW: f32 = 52.0;
 const THUMB_CACHE_MAX: usize = 400;
-const PANEL_IDLE_SECS: f64 = 2.0;
 
 pub struct Viewer {
     dir: PathBuf,
@@ -28,18 +29,17 @@ pub struct Viewer {
     generation: u64,
     loading: bool,
     image: Option<(TextureHandle, Meta)>,
-    bg: Option<TextureHandle>,
+    edge: Option<Color32>,
     error: Option<String>,
     loader: Loader,
-    thumbs: HashMap<PathBuf, TextureHandle>,
+    thumbs: HashMap<PathBuf, (TextureHandle, Color32)>,
     pending: HashSet<PathBuf>,
     dead: HashSet<PathBuf>,
     lru: VecDeque<PathBuf>,
     carousel: bool,
     arrow: f32,
     panel: f32,
-    last_move: f64,
-    last_pos: Option<Pos2>,
+    zoom: f32,
     scroll_to: bool,
 }
 
@@ -52,7 +52,7 @@ impl Viewer {
             generation: 0,
             loading: false,
             image: None,
-            bg: None,
+            edge: None,
             error: None,
             loader: Loader::new(_cc.egui_ctx.clone()),
             thumbs: HashMap::new(),
@@ -62,10 +62,13 @@ impl Viewer {
             carousel: true,
             arrow: 0.0,
             panel: 0.0,
-            last_move: -1e9,
-            last_pos: None,
+            zoom: 1.0,
             scroll_to: false,
         };
+        // Ctrl+scroll zooms the image, not the whole UI.
+        _cc.egui_ctx.options_mut(|o| {
+            o.input_options.zoom_modifier = eframe::egui::Modifiers::NONE;
+        });
         if let Some(p) = path {
             v.open_path(&p);
         }
@@ -126,6 +129,7 @@ impl Viewer {
         self.generation += 1;
         self.loading = true;
         self.error = None;
+        self.zoom = 1.0;
         self.scroll_to = true;
         let path = self.files[self.idx].clone();
         let _ = self.loader.tx.send(Job::Main { generation: self.generation, path });
@@ -139,17 +143,14 @@ impl Viewer {
                 Msg::Main { generation, result } if generation == self.generation => {
                     self.loading = false;
                     match result {
-                        Ok((img, bg_img, meta)) => {
+                        Ok((img, meta)) => {
+                            let edge = edge_color(&img);
                             let tex = ctx.load_texture(
                                 format!("main-{generation}"),
                                 img,
                                 TextureOptions::LINEAR,
                             );
-                            self.bg = Some(ctx.load_texture(
-                                format!("bg-{generation}"),
-                                bg_img,
-                                TextureOptions::LINEAR,
-                            ));
+                            self.edge = Some(edge);
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                                 "{} — Image Viewer",
                                 meta.name
@@ -159,7 +160,7 @@ impl Viewer {
                         }
                         Err(e) => {
                             self.image = None;
-                            self.bg = None;
+                            self.edge = None;
                             self.error = Some(e);
                         }
                     }
@@ -169,9 +170,10 @@ impl Viewer {
                     self.pending.remove(&path);
                     match result {
                         Ok(img) => {
+                            let glow = edge_color(&img);
                             let tex =
                                 ctx.load_texture(format!("t-{}", path.display()), img, TextureOptions::LINEAR);
-                            if self.thumbs.insert(path.clone(), tex).is_none() {
+                            if self.thumbs.insert(path.clone(), (tex, glow)).is_none() {
                                 self.lru.push_back(path.clone());
                             }
                             while self.thumbs.len() > THUMB_CACHE_MAX {
@@ -215,32 +217,40 @@ impl Viewer {
         }
     }
 
-    /// Blurred, darkened copy of the current image covering the whole window.
+    /// Radial glow background: the image's edge color at the center, fading
+    /// smoothly out to black at the window corners.
     fn paint_background(&self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
         let painter = ui.painter().with_clip_rect(full);
-        painter.rect_filled(full, 0.0, Color32::from_rgb(22, 22, 26));
-        if let Some(bg) = &self.bg {
-            let (w, h) = {
-                let s = bg.size();
-                (s[0] as f32, s[1] as f32)
-            };
-            let scale = (full.width() / w).max(full.height() / h);
-            let size = egui::vec2(w * scale, h * scale);
-            let rect = Rect::from_center_size(full.center(), size);
-            painter.image(
-                bg.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::from_rgb(94, 94, 98), // darkening tint
+        painter.rect_filled(full, 0.0, Color32::BLACK);
+        let Some(edge) = self.edge else {
+            return;
+        };
+        let center = full.center();
+        let max_r = ((full.width() * 0.5).powi(2) + (full.height() * 0.5).powi(2)).sqrt();
+        let k = 0.65; // keep the glow subtle
+        let glow = [
+            (edge.r() as f32 * k) as u8,
+            (edge.g() as f32 * k) as u8,
+            (edge.b() as f32 * k) as u8,
+        ];
+        const RINGS: usize = 72;
+        for i in (0..=RINGS).rev() {
+            let t = i as f32 / RINGS as f32; // 0 = center, 1 = far corner
+            let s = t * t * (3.0 - 2.0 * t); // smoothstep falloff
+            let col = Color32::from_rgb(
+                (glow[0] as f32 * (1.0 - s)) as u8,
+                (glow[1] as f32 * (1.0 - s)) as u8,
+                (glow[2] as f32 * (1.0 - s)) as u8,
             );
-            painter.rect_filled(full, 0.0, Color32::from_black_alpha(48));
+            painter.circle_filled(center, (max_r * t).max(1.0), col);
         }
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let full = ui.max_rect();
+        #[cfg(debug_assertions)]
         let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.stable_dt) as f64;
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
@@ -255,9 +265,14 @@ impl Viewer {
             let zone_c = zone_x + full.width() / 16.0;
             pointer = match force.as_str() {
                 "zone" => Some(Pos2::new(zone_c + jitter, full.center().y)),
-                "zone_once" => {
-                    let j = if now < 1.0 { jitter } else { 0.0 };
-                    Some(Pos2::new(zone_c + j, full.center().y))
+                "leave" => {
+                    // Park in the zone, then pull out to the view center:
+                    // exercises the panel closing when the pointer leaves.
+                    let in_zone = now < 1.5;
+                    Some(Pos2::new(
+                        (if in_zone { zone_c } else { full.center().x }) + jitter,
+                        full.center().y,
+                    ))
                 }
                 "center" => Some(Pos2::new(full.center().x + jitter, full.center().y)),
                 _ => pointer,
@@ -265,35 +280,61 @@ impl Viewer {
         }
         let inside = pointer.is_some_and(|p| full.contains(p));
         let in_zone = pointer.is_some_and(|p| p.x >= zone_x && full.contains(p));
-        if let (Some(p), Some(lp)) = (pointer, self.last_pos) {
-            if p != lp && in_zone {
-                self.last_move = now;
+
+        // Ctrl + scroll zooms the main image (1/8x .. 8x).
+        let scroll = ctx.input(|i| i.smooth_scroll_delta);
+        if scroll.y != 0.0 && ctx.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+            self.zoom = (self.zoom * (scroll.y * 0.002).exp()).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(z) = std::env::var("IV_ZOOM") {
+            if let Ok(z) = z.parse::<f32>() {
+                self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX); // fixed zoom for screenshots
             }
         }
-        self.last_pos = pointer;
 
         let k = (1.0 - (-dt * 10.0).exp()) as f32;
-        let panel_t = if in_zone && now - self.last_move < PANEL_IDLE_SECS {
-            1.0
-        } else {
-            0.0
-        };
+        // The panel stays open as long as the pointer is in the right 1/8th.
+        let panel_t = if in_zone { 1.0 } else { 0.0 };
         let arrow_t = if inside { 1.0 } else { 0.0 };
         self.panel += (panel_t - self.panel) * k;
         self.arrow += (arrow_t - self.arrow) * k;
-        // egui repaints reactively: without an explicit wake-up the fade would
-        // freeze mid-animation and the idle auto-hide deadline would never fire.
+        // egui repaints reactively; wake it up while a fade is still in flight.
         if (self.panel - panel_t).abs() > 0.005 || (self.arrow - arrow_t).abs() > 0.005 {
             ctx.request_repaint();
-        }
-        if self.panel > 0.005 {
-            let remaining = (PANEL_IDLE_SECS - (now - self.last_move)).max(0.0);
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining + 0.05));
         }
 
         let image = self.image.take();
         if let Some((tex, meta)) = &image {
-            let rect = fit_rect(meta.w, meta.h, full.shrink(18.0));
+            let avail = full.shrink(18.0);
+            let fit = fit_rect(meta.w, meta.h, avail);
+            let rect = if (self.zoom - 1.0).abs() < 1e-4 {
+                fit
+            } else {
+                let anchor = pointer
+                    .filter(|p| avail.contains(*p))
+                    .unwrap_or(avail.center());
+                let c = anchor + (fit.center() - anchor) * self.zoom;
+                let size = fit.size() * self.zoom;
+                // Pin overflowing axes to the view, center the others.
+                let cx = if size.x >= avail.width() {
+                    c.x.clamp(
+                        avail.right() - size.x * 0.5,
+                        avail.left() + size.x * 0.5,
+                    )
+                } else {
+                    avail.center().x
+                };
+                let cy = if size.y >= avail.height() {
+                    c.y.clamp(
+                        avail.bottom() - size.y * 0.5,
+                        avail.top() + size.y * 0.5,
+                    )
+                } else {
+                    avail.center().y
+                };
+                Rect::from_center_size(Pos2::new(cx, cy), size)
+            };
             ui.painter().image(
                 tex.id(),
                 rect,
@@ -521,7 +562,7 @@ impl Viewer {
             painter.rect_filled(rect, 4.0, Color32::from_white_alpha(22));
         }
         match self.thumbs.get(&path) {
-            Some(tex) => {
+            Some((tex, _glow)) => {
                 let s = tex.size();
                 let r = fit_rect(s[0] as u32, s[1] as u32, thumb_rect);
                 painter.image(
@@ -538,8 +579,30 @@ impl Viewer {
                 }
             }
         }
+        // Selected cell: a soft glow in the image's edge color instead of a
+        // hard border. Concentric strokes radiate outward, fading with distance.
         if i == self.idx {
-            painter.rect_stroke(rect, 4.0, Stroke::new(1.6, Color32::WHITE), egui::StrokeKind::Outside);
+            if let Some((_, glow)) = self.thumbs.get(&path) {
+                // (distance from the thumb, alpha) — spacing >= stroke width,
+                // so the rings never overlap.
+                const RINGS: [(f32, u8); 4] = [(14.0, 26), (10.0, 42), (6.0, 64), (3.0, 96)];
+                for (d, alpha) in RINGS {
+                    painter.rect_stroke(
+                        thumb_rect.expand(d),
+                        6.0,
+                        Stroke::new(
+                            2.0,
+                            Color32::from_rgba_unmultiplied(
+                                glow.r(),
+                                glow.g(),
+                                glow.b(),
+                                alpha,
+                            ),
+                        ),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
         }
         let label_rect = Rect::from_min_size(
             Pos2::new(rect.min.x + 6.0, thumb_rect.max.y + 4.0),
@@ -595,6 +658,34 @@ fn fit_rect(w: u32, h: u32, avail: Rect) -> Rect {
     Rect::from_center_size(avail.center(), size)
 }
 
+/// Average color of an image's border pixels — the tint used for the window's
+/// radial glow and the selected thumbnail's halo.
+fn edge_color(img: &egui::ColorImage) -> Color32 {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let step = (w.max(h) / 64).max(1);
+    let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+    for x in (0..w).step_by(step) {
+        for y in [0, h - 1] {
+            let c = img.pixels[y * w + x];
+            r += c.r() as u32;
+            g += c.g() as u32;
+            b += c.b() as u32;
+            n += 1;
+        }
+    }
+    for y in (0..h).step_by(step) {
+        for x in [0, w - 1] {
+            let c = img.pixels[y * w + x];
+            r += c.r() as u32;
+            g += c.g() as u32;
+            b += c.b() as u32;
+            n += 1;
+        }
+    }
+    let n = n.max(1) as f32;
+    Color32::from_rgb((r as f32 / n) as u8, (g as f32 / n) as u8, (b as f32 / n) as u8)
+}
+
 fn put(painter: &egui::Painter, x: f32, y: f32, text: &str, font: FontId, color: Color32) {
     painter.text(Pos2::new(x, y), egui::Align2::LEFT_TOP, text, font, color);
 }
@@ -613,12 +704,12 @@ fn row(
     y + 34.0
 }
 
-/// Chevron arrow offsets relative to center: left (-1) or right (+1).
+/// Chevron arrow offsets relative to center: left (-1) points left, right (+1) points right.
 fn chevron(dir: f32) -> [(f32, f32); 3] {
     [
-        (7.0 * dir, -11.0),
-        (-7.0 * dir, 0.0),
-        (7.0 * dir, 11.0),
+        (-7.0 * dir, -11.0),
+        (7.0 * dir, 0.0),
+        (-7.0 * dir, 11.0),
     ]
 }
 

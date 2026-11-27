@@ -9,21 +9,22 @@ A fast, minimal, bezel-less image viewer written in Rust (egui/efui-free, built 
 
 - **Full-bleed main view** — the opened image, letterboxed, no borders or toolbars.
   Only normal OS window decorations.
-- **Ambient background** — the current image also covers the entire window behind
-  everything else, blurred and darkened with a black tint.
+- **Ambient glow background** — the current image's edge color radiates from the
+  center of the window out to black, a subtle glow instead of a flat backdrop.
 - **Hover navigation arrows** — previous/next chevrons fade in only while the pointer
   is over the main view.
 - **Metadata side panel** — move the mouse into the rightmost 1/8th of the window and
   a translucent black panel slides in from the right over the image, its left edge
   softly faded into the picture (no hard border). It shows file name, location,
   format, dimensions, file size, last-modified time and selected EXIF fields (camera,
-  lens, focal length, aperture, exposure, ISO, date taken, artist, software). It
-  automatically hides after ~2 seconds of idling, or when the pointer leaves that
-  zone.
+  lens, focal length, aperture, exposure, ISO, date taken, artist, software). It stays
+  open while the pointer is in that zone and closes when the pointer leaves it.
+- **Zoom** — `Ctrl` + scroll wheel zooms the main image, from 1/8x up to 8x, anchored
+  under the pointer.
 - **Bottom carousel** — every other image in the same folder, with file names. Click a
-  thumbnail (or use the arrow keys) to switch images; the selection is highlighted and
-  the carousel scrolls to keep it in view. The carousel reserves its own layout space —
-  it never covers the image.
+  thumbnail (or use the arrow keys) to switch images; the selected thumbnail is marked
+  with a soft glow in that image's edge color, and the carousel scrolls to keep it in
+  view. The carousel reserves its own layout space — it never covers the image.
 - **Hideable carousel** — press `C` or click the small chevron button at the
   bottom-right of the view.
 - **Drag & drop** — drop an image file (or folder) onto the window to open it.
@@ -44,6 +45,7 @@ thread (thumbnails are cached with an LRU cap so large folders stay smooth).
 | ------------- | --------------------------------------------- |
 | `←` / `→`     | Previous / next image in the current folder   |
 | `C`           | Show / hide the bottom carousel               |
+| `Ctrl` + scroll | Zoom the main image (1/8x – 8x)             |
 | mouse hover   | Nav arrows + metadata panel                   |
 | drag & drop   | Open an image or folder                       |
 
