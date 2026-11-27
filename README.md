@@ -20,7 +20,8 @@ A fast, minimal, bezel-less image viewer written in Rust (egui/efui-free, built 
   lens, focal length, aperture, exposure, ISO, date taken, artist, software). It stays
   open while the pointer is in that zone and closes when the pointer leaves it.
 - **Zoom** — `Ctrl` + scroll wheel zooms the main image, from 1/8x up to 8x, anchored
-  under the pointer.
+  under the pointer. The pill at the bottom-left shows the current level — click it to
+  reset to fit-to-window.
 - **Bottom carousel** — every other image in the same folder, with file names. Click a
   thumbnail (or use the arrow keys) to switch images; the selected thumbnail is marked
   with a soft glow in that image's edge color, and the carousel scrolls to keep it in

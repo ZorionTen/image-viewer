@@ -21,6 +21,21 @@ const THUMB_H: f32 = 62.0;
 
 const ARROW: f32 = 52.0;
 const THUMB_CACHE_MAX: usize = 400;
+/// Long-side cap of the pre-rendered background glow texture; LINEAR filtering
+/// upscales the smooth gradient to the window size.
+const GLOW_TEX_MAX: f32 = 400.0;
+/// The image rect is quantized to this step before use as a cache key, so
+/// pointer-driven panning while zoomed doesn't regenerate the glow per frame.
+const GLOW_QUANT: f32 = 4.0;
+
+/// Identity of the pre-rendered background glow: window size, edge color and
+/// the (4px-quantized) drawn image rect it radiates from.
+#[derive(Clone, Copy, PartialEq)]
+struct BgKey {
+    size: [u32; 2],
+    edge: [u8; 3],
+    rect: [i32; 4],
+}
 
 pub struct Viewer {
     dir: PathBuf,
@@ -41,6 +56,10 @@ pub struct Viewer {
     panel: f32,
     zoom: f32,
     scroll_to: bool,
+    /// Rect the main image was drawn at last frame (drives the glow).
+    view_rect: Option<Rect>,
+    /// Pre-rendered glow background, regenerated only when its key changes.
+    bg: Option<(TextureHandle, BgKey)>,
 }
 
 impl Viewer {
@@ -64,6 +83,8 @@ impl Viewer {
             panel: 0.0,
             zoom: 1.0,
             scroll_to: false,
+            view_rect: None,
+            bg: None,
         };
         // Ctrl+scroll zooms the image, not the whole UI.
         _cc.egui_ctx.options_mut(|o| {
@@ -217,34 +238,50 @@ impl Viewer {
         }
     }
 
-    /// Radial glow background: the image's edge color at the center, fading
-    /// smoothly out to black at the window corners.
-    fn paint_background(&self, ui: &mut egui::Ui) {
+    /// Glow background: the image's edge color at the image's edge, fading
+    /// smoothly out to black at the window corners. Pre-rendered into a small
+    /// texture once per (window size, edge color, quantized image rect) and
+    /// drawn as a single quad — no per-frame tessellation.
+    fn paint_background(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let full = ui.max_rect();
         let painter = ui.painter().with_clip_rect(full);
         painter.rect_filled(full, 0.0, Color32::BLACK);
-        let Some(edge) = self.edge else {
-            return;
+        let (Some(edge), Some(rect)) = (self.edge, self.view_rect) else {
+            return; // no image yet: plain black
         };
-        let center = full.center();
-        let max_r = ((full.width() * 0.5).powi(2) + (full.height() * 0.5).powi(2)).sqrt();
-        let k = 0.65; // keep the glow subtle
-        let glow = [
-            (edge.r() as f32 * k) as u8,
-            (edge.g() as f32 * k) as u8,
-            (edge.b() as f32 * k) as u8,
-        ];
-        const RINGS: usize = 72;
-        for i in (0..=RINGS).rev() {
-            let t = i as f32 / RINGS as f32; // 0 = center, 1 = far corner
-            let s = t * t * (3.0 - 2.0 * t); // smoothstep falloff
-            let col = Color32::from_rgb(
-                (glow[0] as f32 * (1.0 - s)) as u8,
-                (glow[1] as f32 * (1.0 - s)) as u8,
-                (glow[2] as f32 * (1.0 - s)) as u8,
-            );
-            painter.circle_filled(center, (max_r * t).max(1.0), col);
+        let key = BgKey {
+            size: [full.width() as u32, full.height() as u32],
+            edge: [edge.r(), edge.g(), edge.b()],
+            rect: [
+                (rect.min.x / GLOW_QUANT).floor() as i32,
+                (rect.min.y / GLOW_QUANT).floor() as i32,
+                (rect.max.x / GLOW_QUANT).floor() as i32,
+                (rect.max.y / GLOW_QUANT).floor() as i32,
+            ],
+        };
+        if let Some((tex, cached)) = &self.bg {
+            if *cached == key {
+                painter.image(
+                    tex.id(),
+                    full,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                return;
+            }
         }
+        let tex = ctx.load_texture(
+            "bg-glow",
+            glow_image(full, rect, edge),
+            TextureOptions::LINEAR,
+        );
+        painter.image(
+            tex.id(),
+            full,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        self.bg = Some((tex, key));
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
@@ -306,41 +343,15 @@ impl Viewer {
 
         let image = self.image.take();
         if let Some((tex, meta)) = &image {
-            let avail = full.shrink(18.0);
-            let fit = fit_rect(meta.w, meta.h, avail);
-            let rect = if (self.zoom - 1.0).abs() < 1e-4 {
-                fit
-            } else {
-                let anchor = pointer
-                    .filter(|p| avail.contains(*p))
-                    .unwrap_or(avail.center());
-                let c = anchor + (fit.center() - anchor) * self.zoom;
-                let size = fit.size() * self.zoom;
-                // Pin overflowing axes to the view, center the others.
-                let cx = if size.x >= avail.width() {
-                    c.x.clamp(
-                        avail.right() - size.x * 0.5,
-                        avail.left() + size.x * 0.5,
-                    )
-                } else {
-                    avail.center().x
-                };
-                let cy = if size.y >= avail.height() {
-                    c.y.clamp(
-                        avail.bottom() - size.y * 0.5,
-                        avail.top() + size.y * 0.5,
-                    )
-                } else {
-                    avail.center().y
-                };
-                Rect::from_center_size(Pos2::new(cx, cy), size)
-            };
+            let rect = zoomed_fit_rect(meta.w, meta.h, self.zoom, full.shrink(18.0), pointer);
+            self.view_rect = Some(rect);
             ui.painter().image(
                 tex.id(),
                 rect,
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 Color32::WHITE,
             );
+            self.paint_zoom(ui, full);
             self.paint_meta(ui, full, meta);
             if self.loading {
                 ui.painter().text(
@@ -404,12 +415,14 @@ impl Viewer {
             0.0,
             Color32::from_rgba_unmultiplied(0, 0, 0, base_alpha),
         );
-        const STRIPS: usize = 24;
+        const STRIPS: usize = 48;
         for i in 0..STRIPS {
             let t = (i as f32 + 0.5) / STRIPS as f32;
             let s = t * t * (3.0 - 2.0 * t); // smoothstep
             let sx = rect.min.x + PANEL_FADE * i as f32 / STRIPS as f32;
-            let sw = PANEL_FADE / STRIPS as f32 + 1.0;
+            // +0.5 overlap only: hides hairline seams without the visible
+            // double-blend banding wider overlaps cause over bright images.
+            let sw = PANEL_FADE / STRIPS as f32 + 0.5;
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(sx, rect.min.y), egui::vec2(sw, rect.height())),
                 0.0,
@@ -502,6 +515,29 @@ impl Viewer {
                 Stroke::new(3.0, Color32::from_white_alpha((stroke * a) as u8)),
             ));
         }
+    }
+
+    /// Zoom pill, bottom-left of the main view. Click resets to fit (100%).
+    fn paint_zoom(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let rect = Rect::from_min_size(
+            Pos2::new(full.left() + 14.0, full.bottom() - 40.0),
+            egui::vec2(52.0, 26.0),
+        );
+        let resp = ui.interact(rect, egui::Id::unique("iv.zoom_label"), Sense::click());
+        if resp.clicked() {
+            self.zoom = 1.0;
+        }
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let a = if resp.hovered() { 150.0 } else { 95.0 };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, a as u8));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}%", (self.zoom * 100.0).round() as i32),
+            FontId::proportional(12.5),
+            Color32::from_white_alpha(235),
+        );
     }
 
     fn paint_toggle(&mut self, ui: &mut egui::Ui, full: Rect) {
@@ -638,7 +674,9 @@ impl eframe::App for Viewer {
             break;
         }
 
-        self.paint_background(ui);
+        // Glow under everything; anchored to the previous frame's image rect
+        // (one frame of lag, invisible on a smooth gradient).
+        self.paint_background(&ctx, ui);
 
         if self.carousel {
             egui::Panel::bottom("carousel")
@@ -656,6 +694,85 @@ fn fit_rect(w: u32, h: u32, avail: Rect) -> Rect {
     let scale = (avail.width() / w).min(avail.height() / h);
     let size = egui::vec2(w * scale, h * scale);
     Rect::from_center_size(avail.center(), size)
+}
+
+/// The drawn main-image rect: letterboxed fit, scaled by `zoom` about the
+/// pointer (fallback: view center). Overflowing axes are pinned to the view,
+/// the others stay centered.
+fn zoomed_fit_rect(w: u32, h: u32, zoom: f32, avail: Rect, pointer: Option<Pos2>) -> Rect {
+    let fit = fit_rect(w, h, avail);
+    if (zoom - 1.0).abs() < 1e-4 {
+        return fit;
+    }
+    let anchor = pointer
+        .filter(|p| avail.contains(*p))
+        .unwrap_or(avail.center());
+    let c = anchor + (fit.center() - anchor) * zoom;
+    let size = fit.size() * zoom;
+    let cx = if size.x >= avail.width() {
+        c.x.clamp(
+            avail.right() - size.x * 0.5,
+            avail.left() + size.x * 0.5,
+        )
+    } else {
+        avail.center().x
+    };
+    let cy = if size.y >= avail.height() {
+        c.y.clamp(
+            avail.bottom() - size.y * 0.5,
+            avail.top() + size.y * 0.5,
+        )
+    } else {
+        avail.center().y
+    };
+    Rect::from_center_size(Pos2::new(cx, cy), size)
+}
+
+/// Distance from a point to a rect (0 inside).
+fn dist_rect(p: Pos2, r: Rect) -> f32 {
+    let dx = (r.min.x - p.x).max(p.x - r.max.x).max(0.0);
+    let dy = (r.min.y - p.y).max(p.y - r.max.y).max(0.0);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// CPU pre-render of the glow gradient: `edge * 0.65` at the image rect's
+/// edge, smoothstep-fading to black at the farthest window corner. Reduced
+/// resolution (long side capped at `GLOW_TEX_MAX`); LINEAR filtering upscales.
+fn glow_image(full: Rect, rect: Rect, edge: Color32) -> egui::ColorImage {
+    let scale = (GLOW_TEX_MAX / full.width().max(full.height())).min(1.0);
+    let (w, h) = (
+        ((full.width() * scale) as usize).max(1),
+        ((full.height() * scale) as usize).max(1),
+    );
+    let corners = [full.min, full.right_top(), full.right_bottom(), full.left_bottom()];
+    let max_d = corners
+        .iter()
+        .map(|c| dist_rect(*c, rect))
+        .fold(0.0f32, f32::max)
+        .max(1e-3);
+    let k = 0.65; // keep the glow subtle
+    let (er, eg, eb) = (
+        edge.r() as f32 * k,
+        edge.g() as f32 * k,
+        edge.b() as f32 * k,
+    );
+    let (sx, sy) = (full.width() / w as f32, full.height() / h as f32);
+    let mut pixels = Vec::with_capacity(w * h);
+    for iy in 0..h {
+        let py = full.top() + (iy as f32 + 0.5) * sy;
+        for ix in 0..w {
+            let px = full.left() + (ix as f32 + 0.5) * sx;
+            let t = (dist_rect(Pos2::new(px, py), rect) / max_d).min(1.0);
+            let s = t * t * (3.0 - 2.0 * t); // smoothstep falloff
+            let inv = 1.0 - s;
+            pixels.push(Color32::from_rgb(
+                (er * inv) as u8,
+                (eg * inv) as u8,
+                (eb * inv) as u8,
+            ));
+        }
+    }
+    egui::ColorImage::new([w, h], pixels)
 }
 
 /// Average color of an image's border pixels — the tint used for the window's
